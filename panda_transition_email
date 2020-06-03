@@ -1,0 +1,143 @@
+---
+title: "Panda Transition Email Test"
+author: "James Reagan"
+date: "5/30/2020"
+output: html_document
+---
+
+```{r load_data, cache=TRUE, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(readr)
+library(tidyverse)
+library(scales)
+library(lubridate)
+
+panda_transition_raw = read_csv("panda_transition_email_2020_03_05.csv")
+panda_transition_total = read_csv("panda_transition_results_total.csv")
+panda_transition_daily_rentals = read_csv("panda_transition_daily_rentals.csv")
+panda_only_transition_daily_rentals = read_csv("panda_transition_daily_rentals_PP_only.csv")
+
+control_rentals = panda_transition_total %>%
+  filter(`Panda Transition Test Campaign` == 'control')
+promo15_rentals = panda_transition_total %>%
+  filter(`Panda Transition Test Campaign` == 'testpromo15')
+promo20_rentals = panda_transition_total %>%
+  filter(`Panda Transition Test Campaign` == 'testpromo20')
+
+panda_transition_daily_rentals$date = mdy(panda_transition_daily_rentals$date)
+panda_transition_daily_rentals$campaign = as.factor(panda_transition_daily_rentals$campaign)
+panda_only_transition_daily_rentals$date = mdy(panda_only_transition_daily_rentals$date)
+panda_only_transition_daily_rentals$campaign = as.factor(panda_only_transition_daily_rentals$campaign)
+```
+
+### About The Test
+
+Goal: Transition Panda users to SpotHero platform via email and provide incentives to drive incremental purchases
+
+Details
+
+* On 3/5/2020, an email was sent to all addressable Panda users - about 350k users. Of those 350k users, only 50k had made a SpotHero purchase prior to the email send
+
+* The 350k users were split into three groups using the modprime method and each group received a different version of the email
+  + Control with no incentive
+  + 15% off incentive
+  + 20% off incentive
+  + *see below for send count by email campaign*
+
+*Note* - COVID-19 likely impacted the results but hard to say if things would've been different otherwise
+
+```{r sent_emails, echo=FALSE, cache=TRUE}
+email_count = panda_transition_raw %>%
+                group_by(campaign) %>%
+                summarize(count_emails_sent = n())
+knitr::kable(email_count, format = "markdown", align = 'c')
+```
+
+### Analyzing The Test
+
+After one month, we revisited the three different campaigns to assess performance.
+
+* While there was a slight lift in rentals per email send for the two campaigns with an incentive, the overall results were essentially the same. No statistical difference between any of the groups
+
+```{r summary_stats, echo=FALSE, cache=TRUE}
+panda_transition_total$`Panda Transition Test Campaign` = as.factor(panda_transition_total$`Panda Transition Test Campaign`)
+
+panda_transition_rename = panda_transition_total %>%
+  rename(rental_count = `Rental Rental Count`,
+         campaign = `Panda Transition Test Campaign`)
+
+panda_transition_rename$`Rental Total Gross Revenue` = as.numeric(str_remove_all(panda_transition_rename$`Rental Total Gross Revenue`, "[$,]"))
+
+total_summary_stats = panda_transition_rename %>%
+  group_by(campaign) %>%
+  summarize(rental_sum = n(),
+            GMV_sum = dollar(sum(`Rental Total Gross Revenue`)),
+            avg_rentals = round(mean(rental_count),digits = 2),
+            avg_gmv = dollar(mean(`Rental Total Gross Revenue`)))
+
+total_summary_with_sends = total_summary_stats %>%
+  mutate(sends = case_when(
+    campaign == 'control' ~ '114,687',
+    campaign == 'testpromo15' ~ '115,137',
+    campaign == 'testpromo20' ~ '114,521'
+  ))
+
+knitr::kable(total_summary_with_sends, format = "markdown", align = 'c')
+```
+
+* Only noticable SpotHero rental lift came on the day of the email send
+
+* Interestingly, the *control* and *testpromo15* campaign groups increased ~60% day-over-day on the day of the send, but the *testpromo20* group only increased ~20%
+
+
+```{r plot_1, echo=FALSE, cache=TRUE, fig.height=4, fig.width=9}
+ggplot(panda_transition_daily_rentals, aes(x=date, y=rentals, color=campaign)) + geom_line(size=1) + geom_vline(xintercept = as.numeric(panda_transition_daily_rentals$date[43]),  linetype = "dashed", size=0.5) + ggtitle("SpotHero Rentals by Campaign")
+```
+
+* Panda rentals appeared to be uneffected by the email
+
+```{r plot_2, echo=FALSE, cache=TRUE, fig.height=4, fig.width=9}
+ggplot(panda_only_transition_daily_rentals, aes(x=date, y=rentals, color=campaign)) + geom_line(size=1) + geom_vline(xintercept = as.numeric(panda_transition_daily_rentals$date[43]),  linetype = "dashed", size=0.5) + ggtitle("Panda Rentals by Campaign")
+```
+
+* Of the 300k potential new SpotHero users, only 456 made their first SpotHero rental within a week of the email. 
+
+* The campaign group *testpromo20* drove the most new users within that time period (166 new users), and that same group also had the highest pecentage of repeat purchases in the following month (20%). 
+
+| Campaign        | New Rentals | Repeat Rentals | Repeat Purchase Percentaage |
+|:---------------:|:------------:|:----------------:|:---------------------------:|
+|   control       |  144        |   18      |   12.5%        |
+|   testpromo15   |  123        |   14      |    9.6%        |
+|   testpromo20   |  166        |   33      |   19.9%        |
+
+
+
+* Below is a summary of each campaign group's SpotHero performance in the month following the email send. Results of an Analysis of Variance (ANOVA) test show that there is not a statiscally signicant difference between the groups. 
+
+```{r anova, echo=FALSE, cache=TRUE}
+
+res.aov = aov(rental_count ~ campaign, data = panda_transition_rename)
+tukey_summary = (TukeyHSD(res.aov))
+tukey_df = as.data.frame(tukey_summary$campaign)
+tukey_df = tukey_df %>%
+  tibble::rownames_to_column() %>%
+  mutate(statistical_difference = case_when(
+    `p adj` < 0.05 ~ 'Yes',
+    `p adj` >= 0.05 ~ 'No'
+  ))
+
+knitr::kable(tukey_df, format = "markdown", align = 'c')
+```
+
+### Summary
+
+* As previously mentioned, the goal of this test was to drive Panda Users to the SpotHero platform, and while there was a small uptick in SpotHero purchases on the day of the email, the increase was not sustained. 
+
+* Less than 1% of potential new SpotHero users ended up making a purchase on the SpotHero platform within a week of the email.
+
+* There was no significant difference between campaign groups in terms of overall rental performance
+
+* Ultimately, we can conclude that email is not an effective tool for transitioning Panda users to become long-term SpotHero users
