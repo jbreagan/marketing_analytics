@@ -1,0 +1,242 @@
+---
+title: "Neighborhood Price Extensions"
+author: "James Reagan"
+date: "8/31/2020"
+output: html_document
+
+---
+
+```{r setup, cache=TRUE, include=FALSE}
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(knitr)
+library(httr)
+
+adwords_interaction = read_csv("adwords_interaction_rates_7172020.csv")
+adwords_interaction$`Created Date` = mdy(adwords_interaction$`Created Date`)
+
+market_sessions = read_csv("market_sessions_8102020.csv")
+market_sessions$created = mdy(market_sessions$created)
+
+ad_group_interaction = read_csv("ad_group_interactions_8192020.csv")
+ad_group_interaction$day = mdy(ad_group_interaction$day)
+
+ad_group_performance = read_csv("ad_group_performance_8242020.csv")
+
+adwords_interaction = adwords_interaction %>%
+  filter(`Reporting Market Top 20` %in% c('Chicago', 'Boston', 'New York', 'San Francisco', 'Washington', 'Atlanta', 'Denver', 'Seattle', 'Los Angeles', 'Philadelphia')) %>%
+    mutate(is_before_pe = case_when(`Created Date` < '2020-06-24' ~ "Before",
+                                    `Created Date` >= '2020-06-24' ~ "After"))
+
+market_sessions = market_sessions %>%
+  mutate(is_before_pe = case_when(created < '2020-06-24' ~ "Before",
+                                  created >= '2020-06-24' ~ "After"))
+
+ad_group_interaction = ad_group_interaction %>%
+  mutate(is_before_pe = case_when(day < '2020-06-24' ~ "Before",
+                                  day >= '2020-06-24' ~ "After"))
+```
+
+## Test Description
+
+Adwords has a feature called 'Extensions' which expand ads with additional information. Typically, Extensions will increase interaction rates as it provides the the user with more incentive to click. For more on Google's price extensions click [HERE](https://support.google.com/google-ads/answer/2375499?hl=en).
+
+For this test, the goal was to improve interaction rates by creating neighborhood level ad extensions displaying links to the three lowest prices available. Historyically, we have seen a correlation between interaction rates and conversion rates, meaning that as interaction rates increase, conversion rates tend to increase (or at least not decease)  at the same time. 
+
+In order to build these price extensions, we needed to identify three main things: the ads, the neighborhood(s) associated with the ads, and lowest prices available for the neighbohoods. For more detail on the test setup, see the dropdown below. Ultimately, using a combination of Segment, Adwords, Zillow, and SpotHero rates data we were able to create an automated process that updates these price extensions on a weekly basis. 
+
+Here's a glimpse of what the price extensions look like in the wild
+
+![Price extension for search 'Chicago Parking' ](price_extension_image.png)
+
+
+
+## Price Extension Creation 
+
+As I mentioned previously, using multiple sources of data, there were three main areas that needed to be identified in order to build the extensions
+
+* The ads
+* The neighborhoods for the ads
+* The three lowest available prices within the neighborhoods
+
+### The Ads
+
+Our Adwords account has tens of thousands of different ads and ad groups, many of which are very low volume due to loction, seasonality, etc. In order to create the most efficient query, I decided to only look at ads that have had clicks within the past 30 days. This allowed us to narrow the ad selection ads that were drawing recent interest. 
+
+### The Neighborhoods
+
+Next, I needed to identify the neighborhoods associated with a particular ad or search. Unfortunately, our ad group syntax is fairly inconsistent which made it very difficult to neighborhood solely from that data. Instead, I used Segment map center in tandem with a Zillow neighborhood table to pinpoint which neighborhood the user searched for. Search and map center results weren't always uniform, so I added a window function to the query to only assoicate the most "popular" neighborhood for an ad based on click volume. 
+
+You can find the query [HERE](https://spothero.looker.com/sql/xgwgpfhz9kcqcn).
+
+### Three Lowest Rates
+
+Finally, in order to display the three lowest prices by neighborhood, I first had to unconver the three lowest prices for every neighborhood we have. From there, I calculated the surronding 0.5 mile radius for every neighborhood and pulled the lowest prices from that area. This allowed the extensions to not only be more flexible but also more competitive. 
+
+The rates I pulled had a number of parameters so as to not pull old or unavailable rates. The parameters are:
+
+* Rate must have been puchased within the past 6 weeks
+* Rate must be currently enabled
+* Rate must be greater than $1
+* Rate cannot be a personal spot
+* Rate needs more than one space available
+
+You can find the final query [HERE](https://spothero.looker.com/sql/7b8gr7m3r85bgh)
+
+
+## Test Analysis
+
+This test began running on June 24th. With no control group, I decided to pull data from 3 weeks before and after June 24th. Unfortunately, COVID-19 made it impossible to assess performance based on Y/Y data or even before June of this year. 
+
+Starting at the market level, I pulled both interaction rate (CTR in the table) and sessions by day. Here's a look at both metrics before and after including price extensions
+
+```{r market_plots, echo=FALSE, cache=TRUE,fig.height=6, fig.width=9}
+ggplot(adwords_interaction, aes(x=`Created Date`, y=CTR, col=is_before_pe)) + geom_line() + geom_smooth(method = "lm") + facet_wrap(~ `Reporting Market Top 20`, scales = "free")+ggtitle("Adwords CTR by Market") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Of the top ten markets shown above, only a handful had significant change in their interaction rate (CTR) from pre-test to post-test. Two of those markets, Denver and Atlanta, had a decrease in interaction rate. Boston, Chicago, and Seattle all had ~1-1.75% increase in CTR. 
+
+```{r market_interaction, echo=FALSE, cache=TRUE}
+adwords_interaction_with_pe = adwords_interaction %>%
+  group_by(`Reporting Market Top 20`, is_before_pe) %>%
+  summarize(average_ctr = mean(CTR)) %>%
+  spread(is_before_pe, average_ctr) %>%
+  mutate(percent_change = (After/Before) - 1,
+         change = After - Before)
+
+adwords_t_test = adwords_interaction %>%
+  group_by(`Reporting Market Top 20`) %>%
+  summarize(p_value = t.test(CTR ~ is_before_pe,var.equal=TRUE)$p.value) %>%
+  mutate(null_hypothesis = case_when(
+    p_value < 0.05 ~ "Reject Null",
+    p_value >= 0.05 ~ "Accept Null"
+  )) %>%
+  filter(null_hypothesis == 'Reject Null')
+
+adwords_small = right_join(adwords_interaction_with_pe, adwords_t_test, by = "Reporting Market Top 20") %>%
+  select(`Reporting Market Top 20`, Before, After, change) %>%
+  mutate(Before = percent(Before, accuracy = 0.01),
+         After = percent(After, accuracy = 0.01),
+         change = percent(change, accuracy = 0.01)) %>%
+  rename('Market' = `Reporting Market Top 20`)
+knitr::kable(adwords_small, format = "markdown", align = 'c')
+```
+
+Although, there was statistically significant positive change in three major markets, assessing change in an entire market is challenging because of the number of factors contributing to a market's success. It's difficult to say that the increase in interaction was solely due to the inclusion of price extensions. More testing and refining will be required to verify to the cause of the change
+
+However, if the increases are a result of the extensions, the upside could be huge. We're currently operating at about 25% of the Paid Search volume we had last year. Using the same spend volume from 2019, a 1% increase in the interaction rate account wide could result in nearly $138k in incremental web GMV or $280k in total GMV. 
+
+```{r adwords_2019_summary, cache=TRUE}
+adwords_2019_spend = 4624686
+ROAS = 3
+App_multiplier = 2
+
+dollar((adwords_2019_spend * 0.01) * ROAS * App_multiplier)
+```
+
+Next step was to get more granular and remove as many outside influences as possible. So, instead of market performance, I pulled ad group performance during the same timeframe.
+
+There were 3,595 different ad groups with at least one impressions during the given timeframe. From that, only 84 ad groups had a meaningful number of sessions, and only 15 ad groups saw a significant change in interaction rate. On average, those 15 ad groups had ~18% CTR before the price extensions and ~21% CTR after.
+
+```{r sig_ad_groups, echo=FALSE, cache=TRUE}
+ad_group_interaction_with_pe = ad_group_interaction %>%
+  group_by(ad_group_name, is_before_pe) %>%
+  summarize(average_CTR = mean(CTR)) %>%
+  spread(is_before_pe,average_CTR) %>%
+  mutate(percent_change = (After/Before) - 1,
+         change = After - Before)
+"%NotIn%" = Negate("%in%")
+
+ad_group_t_test = ad_group_interaction %>%
+  filter(ad_group_name %NotIn% c('parkwhiz_bmm_phrase',
+                               'baltimore_1.1_parking_1_bmm_phrase',
+                               'baltimore_parking-garage_4_main_bmm_phrase',
+                               'baltimore_parking-in_6_main_bmm_phrase',
+                               'nyc_parking-by_16_main_exact',
+                               'tampa_parking_1_main_bmm_phrase'
+  )) %>%
+  group_by(ad_group_name) %>%
+  summarize(p_value = t.test(CTR ~ is_before_pe,var.equal=TRUE)$p.value) %>%
+  mutate(null_hypothesis = case_when(
+    p_value < 0.05 ~ "Reject Null",
+    p_value >= 0.05 ~ "Accept Null"
+  )) %>%
+  filter(null_hypothesis == 'Reject Null')
+
+ad_group_total = left_join(ad_group_t_test, ad_group_interaction_with_pe, by = "ad_group_name") %>%
+  mutate(After = percent(After, accuracy = 0.01),
+         Before = percent(Before, accuracy = 0.01),
+         percent_change = percent(percent_change, accuracy = 0.01),
+         change = percent(change, accuracy = 0.01))
+
+ad_group_total_2 = left_join(ad_group_total, ad_group_performance, by = 'ad_group_name') %>%
+  filter(meaning_session_count == 'Yes') %>%
+  select(ad_group_name, Before, After, change)
+
+knitr::kable(ad_group_total_2, format = "markdown", align = 'c')
+```
+
+When comparing ad groups that have significant increases in interaction rates with those that do not, we see that both groups had on average a 1% increase in conversion rate from pre to post-test. While the significant group is only made up of 15 ad groups compared to 69 non-significant ad groups, it still made up more than half of the total sessions and nearly a third of total GMV. Even with higher volume, the significant group's GMV growth outpaced the non-significant group, 65% improvement compared to 59%
+
+```{r ad_group_summary, echo=FALSE, cache=TRUE}
+significant_ad_groups = as.vector(ad_group_total$ad_group_name)
+
+ad_group_performance_summary = ad_group_performance %>%
+  filter(meaning_session_count == 'Yes') %>%
+  mutate(sig_ad_group = case_when(
+    ad_group_name %in% significant_ad_groups ~ "Yes",
+    ad_group_name %NotIn% significant_ad_groups ~ "No"
+  )) %>%
+  group_by(sig_ad_group) %>%
+  summarize(count = n(),
+            sum_before_sessions = sum(before_sessions),
+            sum_after_sessions = sum(after_sessions),
+            avg_before_sessions = mean(before_sessions),
+            avg_after_sessions = mean(after_sessions),
+            avg_before_CR = mean(before_conversions),
+            avg_after_CR = mean(after_conversions),
+            sum_before_GMV = sum(before_GMV),
+            sum_after_GMV = sum(after_GMV)) %>%
+  mutate(Session_change = (sum_after_sessions/sum_before_sessions)-1,
+         CR_change = avg_after_CR-avg_before_CR,
+         GMV_change = (sum_after_GMV/sum_before_GMV)-1)
+ad_group_performance_summary = ad_group_performance_summary %>%
+  mutate(avg_before_CR = percent(avg_before_CR,accuracy = 0.01),
+         avg_after_CR = percent(avg_after_CR,accuracy = 0.01),
+         Session_change = percent(Session_change,accuracy = 0.01),
+         CR_change = percent(CR_change,accuracy = 0.01),
+         GMV_change = percent(GMV_change,accuracy = 0.01),
+         sum_before_GMV = dollar(sum_before_GMV),
+         sum_after_GMV = dollar(sum_after_GMV))%>%
+  select(sig_ad_group, count, avg_before_sessions, avg_after_sessions, avg_before_CR, avg_after_CR, sum_before_GMV, sum_after_GMV, Session_change, CR_change, GMV_change)
+knitr::kable(ad_group_performance_summary, format = "markdown", align = 'c')
+```
+
+
+If the significant group's impressions volume was at normal levels and its GMV had only grown 59%, that would result in $6k difference during the post-test period. Extrapolating that even further, that could also be viewed as a $55k difference for an entire year just on Web. In corporating the 2x GMV bump Paid Search gets when accounting for App as well, these 15 ad groups could contribute an additional $110k in GMV  
+
+## Test Summary
+
+* Saw ~1% increase in interaction rate in Boston, Chicago, and Seattle; difficult to determine how much of this change was driven by the extensions
+* Low risk, high reward; if the 1% increase in interaction was applied account wide at normal volume, this could mean as much as $280k in incremental GMV
+* Looking at the data more granularly, there were 15 ad groups that had a significant increase in interaction rates - on average they jumped 3% from 18% to 21%
+* In the 3 weeks after price extensions were introduced, those 15 ad groups saw a 65% increase in GMV compared to a 59% increase in the rest of the ad groups.
+* If the 15 ad groups had only grown 59%, it would've missed out on an additional $6k in GMV at our normal volume
+* Broadly speaking, this could be equivalent to ~$55k in web GMV for an entire year or $110k in total GMV with the 2x app multiplier
+
+
+### Next Steps
+
+* The drop in interaction rate in Atlanta and Denver present a potential opportunity for sales to seek out more competitive rates or expansion of the displayed rate radius. I will need to present the findings to both Marketing and Sales to discuss 
+* Continuing to monitor interaction rates across markets and ad groups
+* Work with the Paid Search team to set up more testing with tweaks to what neighborhoods and prices are displayed
+
+### Complications
+
+* No control group
+* Almost every market and ad group improving as COVID-19 restrictions are lifted
+* Increasing Adwords budgets at the same time
+* Can't compare Y/Y numbers because of COVID-19
+* July 4th holiday during the second week of post-test
+* Can't see what ads we're competing against
